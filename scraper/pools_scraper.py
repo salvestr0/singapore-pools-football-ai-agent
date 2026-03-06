@@ -31,6 +31,10 @@ class Match:
     ou_line: Optional[float] = None
     odds_over: Optional[float] = None
     odds_under: Optional[float] = None
+    # Asian Handicap — extracted when SP exposes 9+ float cells per row
+    ah_line: Optional[float] = None
+    ah_home_odds: Optional[float] = None
+    ah_away_odds: Optional[float] = None
 
     @property
     def display_name(self) -> str:
@@ -126,6 +130,30 @@ def _parse_cells(cells: list[str], league: str) -> Optional[Match]:
             odds_over = float(cells[float_indices[4]])
             odds_under = float(cells[float_indices[5]])
 
+        # Asian Handicap — SP sometimes exposes 9 float cells per row:
+        #   [h, d, a] [ah_line, ah_home, ah_away] [ou_line, over, under]
+        # ah_line values like 0.5, 1.0, 1.5 pass _is_odds; negatives don't.
+        # Only extract when we have exactly 9 floats and the 6th looks like
+        # an AH line (<=4) while indices 3-5 look like an O/U block (line 2-5,
+        # odds 1.2-3.5). If ambiguous, leave AH as None rather than misparse.
+        ah_line = ah_home_odds = ah_away_odds = None
+        if len(float_indices) >= 9:
+            try:
+                candidate_line = float(cells[float_indices[6]])
+                candidate_home = float(cells[float_indices[7]])
+                candidate_away = float(cells[float_indices[8]])
+                # Sanity: AH line ≤ 4 goals, both odds between 1.5 and 3.0
+                if (
+                    candidate_line <= 4.0
+                    and 1.5 <= candidate_home <= 3.0
+                    and 1.5 <= candidate_away <= 3.0
+                ):
+                    ah_line = candidate_line
+                    ah_home_odds = candidate_home
+                    ah_away_odds = candidate_away
+            except (ValueError, IndexError):
+                pass
+
         return Match(
             home_team=home_team,
             away_team=away_team,
@@ -137,6 +165,9 @@ def _parse_cells(cells: list[str], league: str) -> Optional[Match]:
             ou_line=ou_line,
             odds_over=odds_over,
             odds_under=odds_under,
+            ah_line=ah_line,
+            ah_home_odds=ah_home_odds,
+            ah_away_odds=ah_away_odds,
         )
     except (ValueError, IndexError):
         return None

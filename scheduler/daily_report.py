@@ -20,6 +20,8 @@ from config import (
 )
 from scraper.pools_scraper import scrape_matches
 from bot.john import predict_match_with_john
+from predictor.parlay import analyze_parlay_correlation, format_correlation_warnings
+from scheduler.odds_monitor import register_odds_monitor
 
 logger = logging.getLogger(__name__)
 
@@ -49,10 +51,15 @@ async def send_daily_report() -> None:
         )
         return
 
-    await bot.send_message(
-        chat_id=TELEGRAM_CHAT_ID,
-        text=f"Good morning. John's daily analysis — {len(matches)} match(es) today.",
-    )
+    # Parlay correlation check — warn about linked picks before individual predictions
+    corr_warnings = analyze_parlay_correlation(matches)
+    corr_text = format_correlation_warnings(corr_warnings)
+
+    intro = f"Good morning. John's daily analysis — {len(matches)} match(es) today."
+    if corr_text:
+        intro += f"\n\n{corr_text}"
+
+    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=intro, parse_mode="HTML")
 
     for match in matches:
         try:
@@ -103,6 +110,7 @@ def create_scheduler() -> AsyncIOScheduler:
         ),
         id="daily_report",
         name="Daily football predictions",
-        misfire_grace_time=300,  # allow 5 min late if system was down
+        misfire_grace_time=300,
     )
+    register_odds_monitor(scheduler)
     return scheduler

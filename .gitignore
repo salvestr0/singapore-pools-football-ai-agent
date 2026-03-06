@@ -9,6 +9,10 @@
 # Local IDE / tool config
 .claude/
 
+# SQLite database (bet tracker — contains user data, never commit)
+*.db
+*.sqlite3
+
 # Python
 __pycache__/
 *.py[cod]

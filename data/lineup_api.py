@@ -42,6 +42,7 @@ class MatchLineups:
     home: TeamLineup
     away: TeamLineup
     both_confirmed: bool = False
+    referee_name: str = ""  # Assigned referee from API-Football fixture data
 
 
 def _sim(a: str, b: str) -> float:
@@ -66,13 +67,13 @@ async def _get(path: str, params: dict) -> dict:
         return {}
 
 
-async def _find_fixture_id(
+async def _find_fixture(
     home_team: str,
     away_team: str,
     match_date: str,
-) -> Optional[int]:
-    """Search for a fixture by team names on a given date (± 1 day window)."""
-    # Try match date and day before/after to handle timezone edge cases
+) -> tuple[Optional[int], str]:
+    """Search for a fixture by team names on a given date (± 1 day window).
+    Returns (fixture_id, referee_name). referee_name is "" if not available."""
     for date_offset in [0, 1, -1]:
         try:
             target = (
@@ -86,9 +87,11 @@ async def _find_fixture_id(
             api_home = fixture.get("teams", {}).get("home", {}).get("name", "")
             api_away = fixture.get("teams", {}).get("away", {}).get("name", "")
             if _sim(home_team, api_home) >= 0.6 and _sim(away_team, api_away) >= 0.6:
-                return fixture["fixture"]["id"]
+                fixture_id = fixture["fixture"]["id"]
+                referee = fixture.get("fixture", {}).get("referee") or ""
+                return fixture_id, referee
 
-    return None
+    return None, ""
 
 
 def _parse_team_lineup(lineup_data: dict, expected_name: str) -> TeamLineup:
@@ -145,7 +148,7 @@ async def get_match_lineups(
         else datetime.now().strftime("%Y-%m-%d")
     )
 
-    fixture_id = await _find_fixture_id(home_team, away_team, match_date)
+    fixture_id, referee_name = await _find_fixture(home_team, away_team, match_date)
     if not fixture_id:
         logger.info("No fixture found for %s vs %s on %s", home_team, away_team, match_date)
         return empty
@@ -155,11 +158,14 @@ async def get_match_lineups(
 
     if not lineup_list:
         logger.info("Lineups not yet released for fixture %s", fixture_id)
+        # Still return the referee even if lineups aren't confirmed
+        empty.referee_name = referee_name
         return empty
 
     result = MatchLineups(
         home=TeamLineup(team_name=home_team),
         away=TeamLineup(team_name=away_team),
+        referee_name=referee_name,
     )
 
     for lineup_data in lineup_list:

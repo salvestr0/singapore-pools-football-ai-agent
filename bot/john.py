@@ -8,9 +8,14 @@ Autonomous tools John can invoke:
   - log_learning(mistake, new_rule)  — append to LEARNINGS.md
   - search_football_news(query)      — DuckDuckGo web search
   - calculate_edge(my_prob, odds)    — compute betting edge + Kelly stake
+  - get_roi_stats()                  — pull prediction track record from DB
+  - record_result(...)               — log actual match result to resolve a prediction
+  - record_prediction(...)           — per-match closure, auto-saves pick to DB
 
 predict_match_with_john(match) — full prediction pipeline:
-  Poisson baseline → John searches injuries/lineups → synthesizes verdict
+  Feeds: football-data.org + Understat xG + API-Football lineups/referee
+         + The Odds API Pinnacle CLV + Open-Meteo weather
+  Poisson model → John synthesizes → auto-saves prediction to tracker
 """
 from __future__ import annotations
 
@@ -27,6 +32,13 @@ from duckduckgo_search import DDGS
 
 from config import GEMINI_API_KEY, GEMINI_MODEL
 from scraper.pools_scraper import Match
+from data.tracker import (
+    get_roi_summary,
+    get_recent_predictions,
+    resolve_prediction,
+    make_match_id,
+    save_prediction,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -238,6 +250,88 @@ def calculate_edge(my_probability: float, decimal_odds: float) -> str:
         return f"Calculation failed: {e}"
 
 
+def get_roi_stats() -> str:
+    """Retrieve your prediction track record and ROI statistics from the bet tracker.
+
+    Call this when asked about your performance, win rate, or profitability.
+    """
+    try:
+        summary = get_roi_summary()
+        recent = get_recent_predictions(limit=5)
+
+        lines = [
+            f"PREDICTION TRACK RECORD:",
+            f"Total bets logged: {summary.total_bets}",
+            f"Resolved: {summary.resolved_bets}",
+            f"Wins: {summary.wins} ({summary.win_rate:.1%} win rate)",
+            f"ROI: {summary.roi_percent:+.1f}%",
+            f"Avg edge at time of bet: {summary.avg_edge:+.1f}%",
+            f"Total Kelly staked: {summary.total_staked_kelly * 100:.1f}% of bankroll",
+        ]
+        if summary.best_win:
+            lines.append(f"Best win: {summary.best_win}")
+        if summary.worst_loss:
+            lines.append(f"Last loss: {summary.worst_loss}")
+
+        if recent:
+            lines.append("\nRECENT PREDICTIONS:")
+            for r in recent:
+                status = "⏳ Pending"
+                if r.get("actual_result"):
+                    won = r["predicted_outcome"] == r["actual_result"]
+                    status = "✅ Won" if won else "❌ Lost"
+                lines.append(
+                    f"  {r['home_team']} vs {r['away_team']} "
+                    f"— {r['predicted_outcome']} — {status}"
+                )
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Could not retrieve stats: {e}"
+
+
+def record_result(
+    home_team: str,
+    away_team: str,
+    match_date: str,
+    home_goals: int,
+    away_goals: int,
+) -> str:
+    """Record the actual full-time result for a match to update prediction accuracy.
+
+    Call this when the user tells you a match result so you can track your ROI.
+
+    Args:
+        home_team: Home team name (as used when the prediction was made)
+        away_team: Away team name
+        match_date: Match date in YYYY-MM-DD format
+        home_goals: Goals scored by the home team
+        away_goals: Goals scored by the away team
+    """
+    try:
+        if home_goals > away_goals:
+            outcome = "Home Win"
+        elif home_goals == away_goals:
+            outcome = "Draw"
+        else:
+            outcome = "Away Win"
+
+        match_id = make_match_id(home_team, away_team, match_date)
+        updated = resolve_prediction(match_id, outcome, home_goals, away_goals)
+
+        if updated:
+            return (
+                f"Result recorded: {home_team} {home_goals}-{away_goals} {away_team} "
+                f"({outcome}). Prediction accuracy updated."
+            )
+        return (
+            f"No pending prediction found for {home_team} vs {away_team} on {match_date}. "
+            "Either it was already resolved or was never logged."
+        )
+    except Exception as e:
+        return f"Failed to record result: {e}"
+
+
 # ── Chat Interface ────────────────────────────────────────────────────────────
 
 JOHN_TOOLS = [
@@ -246,6 +340,8 @@ JOHN_TOOLS = [
     log_learning,
     search_football_news,
     calculate_edge,
+    get_roi_stats,
+    record_result,
 ]
 
 
@@ -297,20 +393,77 @@ def history_length(chat_id: int) -> int:
 
 # ── Match Prediction Pipeline ─────────────────────────────────────────────────
 
+def _make_record_prediction_tool(match: Match, poisson_result, pinnacle, clv):
+    """
+    Factory that returns a match-bound record_prediction tool.
+    Binds match context via closure so John only needs to pass his verdict values.
+    """
+    def record_prediction(
+        predicted_outcome: str,
+        confidence_pct: float,
+        kelly_stake_pct: float,
+    ) -> str:
+        """Record your final prediction verdict to the ROI tracker.
+
+        Call this ONCE after forming your final pick.
+
+        Args:
+            predicted_outcome: Exactly one of "Home Win", "Draw", "Away Win"
+            confidence_pct: Your confidence as a percentage (e.g. 65.0 for 65%)
+            kelly_stake_pct: Your Kelly stake recommendation as % of bankroll (e.g. 3.5)
+        """
+        dt_str = (
+            match.match_datetime.isoformat()
+            if match.match_datetime
+            else datetime.now().isoformat()
+        )
+        try:
+            save_prediction(
+                home_team=match.home_team,
+                away_team=match.away_team,
+                league=match.league or "",
+                match_datetime=dt_str,
+                predicted_outcome=predicted_outcome,
+                confidence=confidence_pct / 100.0,
+                kelly_stake=kelly_stake_pct / 100.0,
+                poisson_home_prob=poisson_result.p_home_win if poisson_result else 0.0,
+                poisson_draw_prob=poisson_result.p_draw if poisson_result else 0.0,
+                poisson_away_prob=poisson_result.p_away_win if poisson_result else 0.0,
+                sp_home_odds=match.odds_home,
+                sp_draw_odds=match.odds_draw,
+                sp_away_odds=match.odds_away,
+                pinnacle_home_odds=pinnacle.home_odds if pinnacle else None,
+                pinnacle_draw_odds=pinnacle.draw_odds if pinnacle else None,
+                pinnacle_away_odds=pinnacle.away_odds if pinnacle else None,
+                best_edge=clv.best_edge if clv else 0.0,
+            )
+            return (
+                f"Prediction logged: {match.display_name} — "
+                f"{predicted_outcome} @ {confidence_pct:.0f}% confidence, "
+                f"{kelly_stake_pct:.1f}% Kelly."
+            )
+        except Exception as e:
+            return f"Failed to log prediction: {e}"
+
+    return record_prediction
+
+
 async def predict_match_with_john(match: Match) -> str:
     """
-    Full prediction pipeline — all 4 data feeds run concurrently:
+    Full prediction pipeline — all 5 data feeds run concurrently:
       1. Football API   — team stats + H2H
       2. Understat      — xG / xGA per game (top EU leagues)
-      3. API-Football   — confirmed starting lineups
+      3. API-Football   — confirmed lineups + referee name
       4. The Odds API   — Pinnacle sharp lines for CLV
-      5. Poisson model  — xG-enhanced expected goals + probabilities
-      6. John           — synthesizes everything, searches for remaining news, gives verdict
+      5. Open-Meteo     — match-day weather forecast
+      6. Poisson model  — xG-enhanced expected goals + probabilities
+      7. John           — synthesizes everything and gives a structured verdict
     """
     from data.football_api import get_match_context, _dummy_stats, H2HRecord
     from data.xg_feed import get_team_xg
     from data.lineup_api import get_match_lineups, format_lineup_for_briefing
     from data.pinnacle import get_pinnacle_odds, build_clv_comparison, format_clv_for_briefing
+    from data.weather import get_match_weather
     from predictor.poisson import run_poisson_model, most_likely_score
 
     ou_line = match.ou_line or 2.5
@@ -323,12 +476,14 @@ async def predict_match_with_john(match: Match) -> str:
         away_xg_res,
         lineups_res,
         pinnacle_res,
+        weather_res,
     ) = await asyncio.gather(
         get_match_context(match.home_team, match.away_team),
         get_team_xg(match.home_team, league),
         get_team_xg(match.away_team, league),
         get_match_lineups(match.home_team, match.away_team, match.match_datetime),
         get_pinnacle_odds(match.home_team, match.away_team, league),
+        get_match_weather(match.home_team, match.match_datetime),
         return_exceptions=True,
     )
 
@@ -345,13 +500,12 @@ async def predict_match_with_john(match: Match) -> str:
     away_xg = None if isinstance(away_xg_res, Exception) else away_xg_res
     lineups = None if isinstance(lineups_res, Exception) else lineups_res
     pinnacle = None if isinstance(pinnacle_res, Exception) else pinnacle_res
+    weather = None if isinstance(weather_res, Exception) else weather_res
 
     # ── Step 2: Enhance Poisson inputs with xG data ──────────────────────────
-    # xG is a better predictor than actual goals — use it when available
     if home_xg:
         home_stats.avg_scored = home_xg.xg_per_game
         home_stats.avg_conceded = home_xg.xga_per_game
-        # Estimate home/away splits with standard ~12% home advantage
         home_stats.home_avg_scored = round(home_xg.xg_per_game * 1.12, 3)
         home_stats.home_avg_conceded = round(home_xg.xga_per_game * 0.90, 3)
 
@@ -363,24 +517,31 @@ async def predict_match_with_john(match: Match) -> str:
 
     # ── Step 3: Run Poisson ───────────────────────────────────────────────────
     try:
-        poisson = run_poisson_model(home_stats, away_stats, h2h, ou_line=ou_line)
-        ml_h, ml_a = most_likely_score(poisson.score_matrix)
+        poisson_result = run_poisson_model(home_stats, away_stats, h2h, ou_line=ou_line)
+        ml_h, ml_a = most_likely_score(poisson_result.score_matrix)
     except Exception as e:
         logger.error("Poisson failed for %s: %s", match.display_name, e)
-        poisson = None
+        poisson_result = None
         ml_h = ml_a = 1
+
+    # Build CLV comparison (needed by record_prediction closure too)
+    clv = None
+    if pinnacle:
+        clv = build_clv_comparison(pinnacle, match.odds_home, match.odds_draw, match.odds_away)
 
     # ── Step 4: Build John's briefing ────────────────────────────────────────
     def _impl(odds: float | None) -> str:
         return f"{1 / odds * 100:.1f}%" if odds else "N/A"
 
     xg_note = " (xG-enhanced via Understat)" if (home_xg or away_xg) else " (goal-average based)"
-    if poisson:
+    if poisson_result:
         poisson_block = (
             f"POISSON MODEL{xg_note}:\n"
-            f"- xG: {poisson.lambda_home:.2f} (Home) vs {poisson.lambda_away:.2f} (Away)\n"
-            f"- P(Home): {poisson.p_home_win:.1%} | P(Draw): {poisson.p_draw:.1%} | P(Away): {poisson.p_away_win:.1%}\n"
-            f"- P(Over {ou_line}): {poisson.p_over_2_5:.1%} | P(Under {ou_line}): {poisson.p_under_2_5:.1%}\n"
+            f"- xG: {poisson_result.lambda_home:.2f} (Home) vs {poisson_result.lambda_away:.2f} (Away)\n"
+            f"- P(Home): {poisson_result.p_home_win:.1%} | P(Draw): {poisson_result.p_draw:.1%} | "
+            f"P(Away): {poisson_result.p_away_win:.1%}\n"
+            f"- P(Over {ou_line}): {poisson_result.p_over_2_5:.1%} | "
+            f"P(Under {ou_line}): {poisson_result.p_under_2_5:.1%}\n"
             f"- Most likely score: {ml_h}-{ml_a}"
         )
     else:
@@ -407,11 +568,19 @@ async def predict_match_with_john(match: Match) -> str:
         f"{away_stats.away_avg_scored:.1f} scored / {away_stats.away_avg_conceded:.1f} conceded | "
         f"Form: {away_stats.form or 'N/A'}\n"
         + (away_xg_line + "\n" if away_xg_line else "")
-        + f"\n"
-        f"HEAD-TO-HEAD (last {h2h.total_matches} meetings): "
+        + f"\nHEAD-TO-HEAD (last {h2h.total_matches} meetings): "
         f"{h2h.home_wins}W / {h2h.draws}D / {h2h.away_wins}L | "
         f"Avg goals: {h2h.avg_goals_home:.1f} - {h2h.avg_goals_away:.1f}"
     )
+
+    # SP odds block — include AH if available
+    ah_line_text = ""
+    if match.ah_line is not None and match.ah_home_odds and match.ah_away_odds:
+        sign = "+" if match.ah_line >= 0 else ""
+        ah_line_text = (
+            f"\n- Asian Handicap {sign}{match.ah_line}: "
+            f"Home {match.ah_home_odds} | Away {match.ah_away_odds}"
+        )
 
     sp_block = (
         f"SINGAPORE POOLS ODDS:\n"
@@ -419,15 +588,33 @@ async def predict_match_with_john(match: Match) -> str:
         f"Draw: {match.odds_draw} (implied {_impl(match.odds_draw)}) | "
         f"Away: {match.odds_away} (implied {_impl(match.odds_away)})\n"
         f"- O/U {ou_line}: Over {match.odds_over} | Under {match.odds_under}"
+        + ah_line_text
     )
 
     lineup_block = format_lineup_for_briefing(lineups) if lineups else "LINEUPS: Not fetched."
 
-    if pinnacle:
-        clv = build_clv_comparison(pinnacle, match.odds_home, match.odds_draw, match.odds_away)
-        clv_block = format_clv_for_briefing(clv)
+    # Referee block — from fixture data
+    referee_block = ""
+    if lineups and lineups.referee_name:
+        referee_block = (
+            f"REFEREE: {lineups.referee_name}\n"
+            f"(Search '{lineups.referee_name} cards statistics 2025' if his tendencies are relevant "
+            f"to your O/U or discipline picks.)"
+        )
+
+    clv_block = format_clv_for_briefing(clv) if clv else "PINNACLE LINES: Not available for this league/match."
+
+    # Weather block
+    weather_block = ""
+    if weather:
+        weather_block = (
+            f"WEATHER ({match.home_team} stadium, match day):\n"
+            f"- {weather.condition} | {weather.temperature_c}°C | "
+            f"Wind: {weather.wind_speed_kmh} km/h | Rain: {weather.precipitation_mm}mm\n"
+            f"- Betting impact: {weather.impact}"
+        )
     else:
-        clv_block = "PINNACLE LINES: Not available for this league/match."
+        weather_block = "WEATHER: No forecast available (stadium coordinates unknown)."
 
     month_year = datetime.now().strftime("%B %Y")
     lineups_confirmed = lineups and lineups.both_confirmed
@@ -440,6 +627,8 @@ async def predict_match_with_john(match: Match) -> str:
         f"{poisson_block}\n\n"
         f"{team_block}\n\n"
         f"{lineup_block}\n\n"
+        + (referee_block + "\n\n" if referee_block else "")
+        + f"{weather_block}\n\n"
         f"{sp_block}\n\n"
         f"{clv_block}\n\n"
         f"STEPS (follow in order):\n"
@@ -449,21 +638,26 @@ async def predict_match_with_john(match: Match) -> str:
             f"1. Lineups not confirmed. Call search_football_news('{match.home_team} lineup injury {month_year}') "
             f"and search_football_news('{match.away_team} lineup injury {month_year}').\n"
         )
-        + f"2. Based on lineup/injury intel, state your adjusted probability for each outcome vs the Poisson baseline.\n"
-        f"3. Cross-check: does the Pinnacle CLV agree with your pick? Note any conflicts.\n"
-        f"4. Pick your best market. Call calculate_edge with your adjusted probability and the SP odds.\n"
-        f"5. Verdict: selection, edge %, confidence, 2-3 sentence reasoning covering model + intel.\n\n"
+        + f"2. Factor in weather impact on the O/U prediction. Adjust probabilities accordingly.\n"
+        f"3. Based on lineup/injury intel and weather, state your adjusted probability for each outcome vs Poisson.\n"
+        f"4. Cross-check: does the Pinnacle CLV agree with your pick? Note any conflicts.\n"
+        f"5. Pick your best market (1X2 or O/U or AH if available). Call calculate_edge with your probability and SP odds.\n"
+        f"6. Call record_prediction with your final outcome, confidence %, and Kelly stake %.\n"
+        f"7. Verdict: selection, edge %, confidence, 2-3 sentence reasoning covering model + intel + weather.\n\n"
         f"Use **bold** for headers and your final verdict. Keep it concise for Telegram."
     )
 
     # ── Step 5: John reasons and responds ────────────────────────────────────
     try:
         client = _get_client()
+        record_tool = _make_record_prediction_tool(match, poisson_result, pinnacle, clv)
+        prediction_tools = JOHN_TOOLS + [record_tool]
+
         chat = client.aio.chats.create(
             model=GEMINI_MODEL,
             config=types.GenerateContentConfig(
                 system_instruction=_build_system_prompt(),
-                tools=JOHN_TOOLS,
+                tools=prediction_tools,
                 automatic_function_calling=types.AutomaticFunctionCallingConfig(
                     disable=False,
                 ),

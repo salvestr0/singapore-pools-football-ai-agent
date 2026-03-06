@@ -12,6 +12,7 @@ from telegram.ext import Application
 from config import TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY, GEMINI_API_KEY
 from bot.handlers import register_handlers
 from scheduler.daily_report import create_scheduler
+from data.tracker import init_db
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -51,6 +52,7 @@ async def post_shutdown(app: Application) -> None:
 
 def main() -> None:
     _check_config()
+    init_db()
 
     app = (
         Application.builder()

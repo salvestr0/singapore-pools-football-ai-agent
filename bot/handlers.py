@@ -19,6 +19,7 @@ from bot.formatter import (
     format_no_matches,
 )
 from bot.john import chat_with_john, clear_history, history_length, predict_match_with_john
+from data.tracker import get_roi_summary, get_recent_predictions
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "*Commands:*\n"
         "/matches \\— List upcoming fixtures \\+ odds\n"
         "/predict \\— AI predictions for all matches\n"
+        "/results \\— John's ROI track record\n"
+        "/bets \\— Recent predictions and outcomes\n"
         "/reset \\— Clear John's conversation history\n"
         "/help \\— Show this message",
         parse_mode="MarkdownV2",
@@ -166,6 +169,72 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("John's memory cleared. Fresh start.")
 
 
+async def cmd_results(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show John's prediction track record and ROI summary."""
+    if not _is_authorized(update):
+        return
+    try:
+        s = get_roi_summary()
+        roi_sign = "+" if s.roi_percent >= 0 else ""
+        edge_sign = "+" if s.avg_edge >= 0 else ""
+
+        lines = [
+            "<b>John's Track Record</b>",
+            "─" * 22,
+            f"Predictions logged:  {s.total_bets}",
+            f"Resolved:            {s.resolved_bets}",
+            f"Wins:                {s.wins} ({s.win_rate:.1%})",
+            f"ROI:                 {roi_sign}{s.roi_percent:.1f}%",
+            f"Avg edge at bet:     {edge_sign}{s.avg_edge:.1f}%",
+            f"Total Kelly staked:  {s.total_staked_kelly * 100:.1f}% bankroll",
+        ]
+        if s.best_win:
+            lines.append(f"\nBest win:  {s.best_win}")
+        if s.worst_loss:
+            lines.append(f"Last loss: {s.worst_loss}")
+
+        if s.resolved_bets == 0:
+            lines.append("\nNo resolved predictions yet. Use /predict and record results.")
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    except Exception as e:
+        await update.message.reply_text(_safe_error(e))
+
+
+async def cmd_bets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List the 10 most recent predictions with their status."""
+    if not _is_authorized(update):
+        return
+    try:
+        recent = get_recent_predictions(limit=10)
+        if not recent:
+            await update.message.reply_text("No predictions logged yet. Run /predict first.")
+            return
+
+        lines = ["<b>Recent Predictions</b>", "─" * 22]
+        for r in recent:
+            if r.get("actual_result"):
+                won = r["predicted_outcome"] == r["actual_result"]
+                icon = "✅" if won else "❌"
+                status = f"{icon} {r['actual_result']}"
+            else:
+                status = "⏳ Pending"
+
+            date = (r.get("match_datetime") or "")[:10]
+            edge = r.get("best_edge") or 0.0
+            lines.append(
+                f"{r['home_team']} vs {r['away_team']} ({date})\n"
+                f"  Pick: <b>{r['predicted_outcome']}</b> | "
+                f"Edge: {edge:+.1f}% | {status}"
+            )
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    except Exception as e:
+        await update.message.reply_text(_safe_error(e))
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Route all non-command text messages to John."""
     if not _is_authorized(update):
@@ -206,6 +275,8 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("matches", cmd_matches))
     app.add_handler(CommandHandler("predict", cmd_predict))
+    app.add_handler(CommandHandler("results", cmd_results))
+    app.add_handler(CommandHandler("bets", cmd_bets))
     app.add_handler(CommandHandler("reset", cmd_reset))
     # Free-text messages go to John — must be registered last
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

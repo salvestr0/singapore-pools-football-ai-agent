@@ -27,3 +27,12 @@ GEMINI_MODEL = "gemini-2.5-flash"
 DAILY_REPORT_HOUR = 8
 DAILY_REPORT_MINUTE = 0
 SCHEDULER_TIMEZONE = "Asia/Singapore"
+
+# Odds movement alert threshold — % change that triggers a Telegram alert
+ODDS_MOVE_THRESHOLD = 8.0
+
+# Value bet push threshold — minimum Kelly edge (%) to trigger an immediate alert
+VALUE_BET_KELLY_THRESHOLD = 5.0
+
+# Odds monitor polling interval (minutes)
+ODDS_MONITOR_INTERVAL_MINUTES = 30
