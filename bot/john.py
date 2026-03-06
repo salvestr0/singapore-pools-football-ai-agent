@@ -14,6 +14,7 @@ predict_match_with_john(match) — full prediction pipeline:
 """
 from __future__ import annotations
 
+import html
 import logging
 import re
 from datetime import datetime
@@ -85,12 +86,35 @@ RESPONSE RULES:
 - Be direct, sharp, and analytical. No fluff.
 - When giving predictions: always show probabilities, SP implied odds, and edge calculation.
 - When you lack live data: use search_football_news to find it, then reason from what you find.
-- Keep responses concise for Telegram. Plain text only — no heavy markdown.
+- Keep responses concise for Telegram.
+- FORMATTING: Use **bold** for headers, team names, verdicts, and key numbers. Use _italics_ sparingly. No other markdown syntax.
 - No "as an AI" disclaimers. You are John, a professional bettor.
 - If asked something outside football/betting: "That's outside my lane. Ask me about football."
 - When a user corrects you: acknowledge plainly, call log_learning to record the rule, then adjust.
 - Proactively use tools: search for news before predicting, update memory after decisions, log mistakes immediately.
 """
+
+
+# ── Formatting ───────────────────────────────────────────────────────────────
+
+def _format_for_telegram(text: str) -> str:
+    """
+    Convert John's natural **bold** / _italic_ markdown to Telegram HTML.
+
+    Order matters:
+      1. html.escape() first — turns &, <, > into safe entities so
+         raw text like "P(Home) > 50%" or "Man City & Arsenal" can't
+         break the HTML parser.
+      2. Then apply our controlled tag conversions on the now-safe string.
+    """
+    safe = html.escape(text)
+    # **bold** → <b>bold</b>  (no newlines inside)
+    safe = re.sub(r'\*\*([^*\n]+?)\*\*', r'<b>\1</b>', safe)
+    # _italic_  → <i>italic</i>  (word-boundary only, no newlines)
+    safe = re.sub(r'(?<!\w)_([^_\n]+?)_(?!\w)', r'<i>\1</i>', safe)
+    # `code` → <code>code</code>
+    safe = re.sub(r'`([^`\n]+?)`', r'<code>\1</code>', safe)
+    return safe
 
 
 # ── Autonomous Tools ──────────────────────────────────────────────────────────
@@ -251,7 +275,8 @@ async def chat_with_john(chat_id: int, user_message: str) -> str:
             full_history = full_history[-(  _MAX_HISTORY_TURNS * 2):]
         _history[chat_id] = full_history
 
-        return response.text or "Got it. Anything else?"
+        raw = response.text or "Got it. Anything else?"
+        return _format_for_telegram(raw)
 
     except Exception as e:
         logger.error("Gemini error for chat_id=%s: %s", chat_id, e)
@@ -363,7 +388,7 @@ async def predict_match_with_john(match: Match) -> str:
         f"5. Give your final verdict: selection, edge %, confidence level, and 2-3 sentence reasoning "
         f"covering both the stats and the injury/lineup intel you found.\n"
         f"\n"
-        f"Keep the output concise — this is going to Telegram. Plain text only."
+        f"Keep the output concise — this is going to Telegram. Use **bold** for headers and key verdicts."
     )
 
     # ── Step 3: John analyzes and responds ───────────────────────────────────
@@ -381,7 +406,8 @@ async def predict_match_with_john(match: Match) -> str:
             ),
         )
         response = await chat.send_message(briefing)
-        return response.text or "No prediction generated."
+        raw = response.text or "No prediction generated."
+        return _format_for_telegram(raw)
 
     except Exception as e:
         logger.error("John prediction failed for %s: %s", match.display_name, e)

@@ -68,11 +68,11 @@ async def send_daily_report() -> None:
             full_text = header + prediction
             # Split if over Telegram's 4096 char limit
             if len(full_text) <= 4096:
-                await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=full_text)
+                await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=full_text, parse_mode="HTML")
             else:
                 for i in range(0, len(full_text), 4096):
                     await bot.send_message(
-                        chat_id=TELEGRAM_CHAT_ID, text=full_text[i:i + 4096]
+                        chat_id=TELEGRAM_CHAT_ID, text=full_text[i:i + 4096], parse_mode="HTML"
                     )
                     await asyncio.sleep(0.3)
 

@@ -145,10 +145,10 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
             full_text = header + prediction
             if len(full_text) <= 4096:
-                await update.message.reply_text(full_text)
+                await update.message.reply_text(full_text, parse_mode="HTML")
             else:
                 for i in range(0, len(full_text), 4096):
-                    await update.message.reply_text(full_text[i:i + 4096])
+                    await update.message.reply_text(full_text[i:i + 4096], parse_mode="HTML")
                     await asyncio.sleep(0.3)
 
         except Exception as e:
@@ -192,10 +192,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Telegram message limit is 4096 chars — split if needed
     if len(reply) <= 4096:
-        await update.message.reply_text(reply)
+        await update.message.reply_text(reply, parse_mode="HTML")
     else:
         for i in range(0, len(reply), 4096):
-            await update.message.reply_text(reply[i:i + 4096])
+            await update.message.reply_text(reply[i:i + 4096], parse_mode="HTML")
             await asyncio.sleep(0.3)
 
 
