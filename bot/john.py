@@ -105,6 +105,18 @@ RESPONSE RULES:
 - If asked something outside football/betting: "That's outside my lane. Ask me about football."
 - When a user corrects you: acknowledge plainly, call log_learning to record the rule, then adjust.
 - Proactively use tools: search for news before predicting, update memory after decisions, log mistakes immediately.
+
+PREDICTION FORMAT RULES — READ CAREFULLY:
+- PROBABILITY vs CONFIDENCE are NOT the same thing. Never confuse them.
+  - P(outcome) = the model's estimated chance the event occurs (e.g. 28.6% Away Win)
+  - Your confidence = how reliable your probability estimate is (HIGH/MEDIUM/LOW based on data quality)
+  - A 28.6% Away Win at 4.2 odds CAN be a value bet — that does not make your confidence HIGH if you had no lineup data.
+- Always state DATA QUALITY explicitly: "Data: Complete (xG + lineups + Pinnacle)" or "Data: Incomplete (Poisson only, no lineups)"
+- When lineups were NOT confirmed: your confidence MUST be LOW or MEDIUM at best. State this clearly.
+- NEVER output "Confidence: 28.6%" — that is a probability, not confidence. Use "Confidence: LOW/MEDIUM/HIGH"
+- Follow the calculate_edge verdict exactly. If it says MARGINAL or PASS, do not override it to BET.
+- Only recommend BET when: edge ≥ 5%, half Kelly ≥ 2%, AND you have at least MEDIUM data quality.
+- Always show the Kelly stake recommendation alongside the verdict so the user knows position size.
 """
 
 
@@ -230,19 +242,38 @@ def calculate_edge(my_probability: float, decimal_odds: float) -> str:
         my_probability: Your estimated true win probability as a decimal (e.g. 0.55 for 55%)
         decimal_odds: Singapore Pools decimal odds for this selection (e.g. 2.10)
     """
+    # Minimum half-Kelly stake required before recommending a bet.
+    # A tiny Kelly means the edge is real but the position sizing is so small
+    # that variance wipes it out — not worth the risk.
+    _MIN_HALF_KELLY_PCT = 2.0   # 2% of bankroll minimum
+    _MIN_EDGE_PCT = 5.0         # 5% edge minimum to call it a BET
+
     try:
         implied_prob = 1.0 / decimal_odds
         edge_pct = (my_probability - implied_prob) / implied_prob * 100
         kelly = (my_probability * decimal_odds - 1.0) / (decimal_odds - 1.0)
         half_kelly = kelly / 2.0
-        verdict = "BET" if edge_pct > 3 else ("PASS" if edge_pct <= 0 else "MARGINAL — thin edge, small stake only")
+        half_kelly_pct = half_kelly * 100
+
+        if edge_pct >= _MIN_EDGE_PCT and half_kelly_pct >= _MIN_HALF_KELLY_PCT:
+            verdict = f"BET — stake {half_kelly_pct:.1f}% of bankroll (half Kelly)"
+        elif edge_pct > 0:
+            if half_kelly_pct < _MIN_HALF_KELLY_PCT:
+                verdict = (
+                    f"MARGINAL — edge exists but Kelly stake is only {half_kelly_pct:.1f}%, "
+                    "too small to justify variance. Skip or micro-stake."
+                )
+            else:
+                verdict = f"MARGINAL — edge below {_MIN_EDGE_PCT}%, proceed with caution"
+        else:
+            verdict = "PASS — negative edge, SP has the better of this"
+
         return (
-            f"My probability: {my_probability * 100:.1f}%\n"
-            f"SP implied:     {implied_prob * 100:.1f}%\n"
-            f"Edge:           {edge_pct:+.1f}%\n"
-            f"Full Kelly:     {kelly * 100:.1f}% of bankroll\n"
-            f"Half Kelly:     {half_kelly * 100:.1f}% of bankroll\n"
-            f"Verdict:        {verdict}"
+            f"P(outcome):  {my_probability * 100:.1f}%\n"
+            f"SP implied:  {implied_prob * 100:.1f}%\n"
+            f"Edge:        {edge_pct:+.1f}%\n"
+            f"Half Kelly:  {half_kelly_pct:.1f}% of bankroll\n"
+            f"Verdict:     {verdict}"
         )
     except ZeroDivisionError:
         return "Invalid odds — cannot divide by zero."
