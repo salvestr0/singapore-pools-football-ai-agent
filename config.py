@@ -8,6 +8,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 FOOTBALL_DATA_API_KEY = os.getenv("FOOTBALL_DATA_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY", "")   # api-sports.io — real-time lineups
+ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")            # the-odds-api.com — Pinnacle CLV
 
 SP_ODDS_URL = "https://www.singaporepools.com.sg/en/product/Pages/football_odds.aspx"
 FOOTBALL_DATA_BASE_URL = "https://api.football-data.org/v4"

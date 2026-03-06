@@ -4,6 +4,7 @@ Singapore Pools football odds scraper using Playwright.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -12,6 +13,8 @@ from typing import Optional
 from playwright.async_api import async_playwright, Page
 
 from config import SP_ODDS_URL
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -41,77 +44,69 @@ class Match:
 
 
 async def _extract_matches(page: Page) -> list[Match]:
-    """Parse the SP football odds page structure."""
-    matches: list[Match] = []
-
-    # Wait for odds table to load
+    """
+    Extract matches using JavaScript evaluation — runs in browser context so
+    JS-rendered content is fully available. Falls back to text parsing.
+    """
+    # Try to extract structured row data via JS
     try:
-        await page.wait_for_selector("table.football-table, .odds-table, [class*='football']", timeout=15000)
-    except Exception:
-        pass  # Continue and try to extract what we can
+        rows_data: list[dict] = await page.evaluate("""() => {
+            return Array.from(document.querySelectorAll('tr')).map(tr => ({
+                text: tr.innerText.trim(),
+                cells: Array.from(tr.querySelectorAll('td, th')).map(td => td.innerText.trim())
+            })).filter(r => r.cells.length > 0 && r.text.length > 0);
+        }""")
+    except Exception as e:
+        logger.warning("JS evaluation failed, falling back to selector approach: %s", e)
+        rows_data = []
 
-    # Try to find match rows — SP uses a table-based layout
-    # We'll extract all text and parse it structurally
-    rows = await page.query_selector_all("tr")
+    if rows_data:
+        return _parse_rows_data(rows_data)
 
+    # Fallback: original selector-based approach
+    return await _extract_matches_selector(page)
+
+
+def _parse_rows_data(rows_data: list[dict]) -> list[Match]:
+    """Parse the list of {text, cells} dicts extracted via JavaScript."""
+    matches: list[Match] = []
     current_league = ""
-    i = 0
-    while i < len(rows):
-        row = rows[i]
-        text = (await row.inner_text()).strip()
 
-        # Skip empty rows
-        if not text:
-            i += 1
+    for row in rows_data:
+        cells = row.get("cells", [])
+        text = row.get("text", "")
+
+        if not cells:
             continue
 
-        # Detect league header rows (no odds, just league name)
-        cells = await row.query_selector_all("td, th")
-        if len(cells) <= 2 and text and not any(c in text for c in [".", "/"]):
-            current_league = text
-            i += 1
+        # League header: few cells, no float-like values
+        float_indices = [i for i, c in enumerate(cells) if _is_odds(c)]
+        if len(float_indices) < 3:
+            # Could be a league header
+            if len(cells) <= 3 and text and not any(c in text for c in [".", "/"]):
+                current_league = text.strip()
             continue
 
-        # Try to extract a match row (has team names + odds)
-        match = await _parse_match_row(row, current_league)
+        match = _parse_cells(cells, current_league)
         if match:
             matches.append(match)
-
-        i += 1
 
     return matches
 
 
-async def _parse_match_row(row, league: str) -> Optional[Match]:
-    """Attempt to parse a table row as a match with odds."""
-    cells = await row.query_selector_all("td")
-    if len(cells) < 5:
-        return None
-
-    texts = []
-    for cell in cells:
-        t = (await cell.inner_text()).strip()
-        texts.append(t)
-
-    # SP odds page typically has columns:
-    # Date/Time | Home Team | Away Team | Home Odds | Draw Odds | Away Odds | [OU line | Over | Under]
-    # Try to detect the pattern by finding float-like values
-    float_indices = [i for i, t in enumerate(texts) if _is_odds(t)]
-
+def _parse_cells(cells: list[str], league: str) -> Optional[Match]:
+    """Parse a list of cell strings into a Match object."""
+    float_indices = [i for i, c in enumerate(cells) if _is_odds(c)]
     if len(float_indices) < 3:
         return None
 
     try:
-        # Find team name indices (non-float, non-date cells before odds)
         odds_start = float_indices[0]
-
-        # Team names are likely in the cells just before the first odds
         if odds_start >= 2:
-            home_team = texts[odds_start - 2].strip()
-            away_team = texts[odds_start - 1].strip()
+            home_team = cells[odds_start - 2].strip()
+            away_team = cells[odds_start - 1].strip()
         elif odds_start == 1:
-            # Maybe date is separate row; just use what we have
-            home_team = texts[0].strip()
+            home_team = cells[0].strip()
             away_team = ""
         else:
             return None
@@ -119,22 +114,17 @@ async def _parse_match_row(row, league: str) -> Optional[Match]:
         if not home_team or not away_team:
             return None
 
-        # Parse datetime from first cells
-        dt = _parse_datetime(texts[0] if odds_start > 2 else "")
+        dt = _parse_datetime(cells[0] if odds_start > 2 else "")
 
-        # Odds: first three floats are 1X2
-        odds_home = float(texts[float_indices[0]])
-        odds_draw = float(texts[float_indices[1]])
-        odds_away = float(texts[float_indices[2]])
+        odds_home = float(cells[float_indices[0]])
+        odds_draw = float(cells[float_indices[1]])
+        odds_away = float(cells[float_indices[2]])
 
-        # O/U: next floats if present
-        ou_line = None
-        odds_over = None
-        odds_under = None
+        ou_line = odds_over = odds_under = None
         if len(float_indices) >= 6:
-            ou_line = float(texts[float_indices[3]])
-            odds_over = float(texts[float_indices[4]])
-            odds_under = float(texts[float_indices[5]])
+            ou_line = float(cells[float_indices[3]])
+            odds_over = float(cells[float_indices[4]])
+            odds_under = float(cells[float_indices[5]])
 
         return Match(
             home_team=home_team,
@@ -150,6 +140,42 @@ async def _parse_match_row(row, league: str) -> Optional[Match]:
         )
     except (ValueError, IndexError):
         return None
+
+
+async def _extract_matches_selector(page: Page) -> list[Match]:
+    """Original selector-based fallback extractor."""
+    matches: list[Match] = []
+    try:
+        await page.wait_for_selector(
+            "table.football-table, .odds-table, [class*='football'], tr",
+            timeout=10000,
+        )
+    except Exception:
+        pass
+
+    rows = await page.query_selector_all("tr")
+    current_league = ""
+
+    for row in rows:
+        text = (await row.inner_text()).strip()
+        if not text:
+            continue
+        cells_els = await row.query_selector_all("td, th")
+        cells = [(await c.inner_text()).strip() for c in cells_els]
+        float_indices = [i for i, c in enumerate(cells) if _is_odds(c)]
+
+        if len(float_indices) < 3:
+            if len(cells) <= 3 and not any(ch in text for ch in [".", "/"]):
+                current_league = text
+            continue
+
+        match = _parse_cells(cells, current_league)
+        if match:
+            matches.append(match)
+
+    return matches
+
+
 
 
 def _is_odds(text: str) -> bool:
@@ -195,18 +221,18 @@ async def scrape_matches() -> list[Match]:
         page = await context.new_page()
 
         try:
-            await page.goto(SP_ODDS_URL, wait_until="networkidle", timeout=30000)
-            # Give JS-rendered content extra time
-            await page.wait_for_timeout(3000)
+            await page.goto(SP_ODDS_URL, wait_until="domcontentloaded", timeout=30000)
+            # Extra wait for JS-rendered odds to populate
+            await page.wait_for_timeout(4000)
             matches = await _extract_matches(page)
         except Exception as e:
-            print(f"[scraper] Error: {e}")
+            logger.error("Scraper error: %s", e)
             matches = []
         finally:
             await browser.close()
 
     if not matches:
-        print("[scraper] No matches found — returning demo data")
+        logger.warning("No matches scraped — returning demo data")
         matches = _demo_matches()
 
     return matches

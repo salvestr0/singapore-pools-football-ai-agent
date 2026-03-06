@@ -14,6 +14,7 @@ predict_match_with_john(match) — full prediction pipeline:
 """
 from __future__ import annotations
 
+import asyncio
 import html
 import logging
 import re
@@ -298,66 +299,119 @@ def history_length(chat_id: int) -> int:
 
 async def predict_match_with_john(match: Match) -> str:
     """
-    Full prediction for a single match:
-      1. Fetch team stats + H2H from football API
-      2. Run Poisson model for statistical baseline
-      3. Pass everything to John — he searches for injuries/lineups,
-         adjusts probabilities, calculates edge, and gives his verdict.
-
-    Uses a fresh stateless chat (no conversational history contamination).
+    Full prediction pipeline — all 4 data feeds run concurrently:
+      1. Football API   — team stats + H2H
+      2. Understat      — xG / xGA per game (top EU leagues)
+      3. API-Football   — confirmed starting lineups
+      4. The Odds API   — Pinnacle sharp lines for CLV
+      5. Poisson model  — xG-enhanced expected goals + probabilities
+      6. John           — synthesizes everything, searches for remaining news, gives verdict
     """
-    from data.football_api import get_match_context
+    from data.football_api import get_match_context, _dummy_stats, H2HRecord
+    from data.xg_feed import get_team_xg
+    from data.lineup_api import get_match_lineups, format_lineup_for_briefing
+    from data.pinnacle import get_pinnacle_odds, build_clv_comparison, format_clv_for_briefing
     from predictor.poisson import run_poisson_model, most_likely_score
 
     ou_line = match.ou_line or 2.5
+    league = match.league or ""
 
-    # ── Step 1: Statistical foundation ───────────────────────────────────────
-    poisson = None
-    home_stats = away_stats = h2h = None
-    ml_h = ml_a = 1
+    # ── Step 1: All data feeds in parallel ───────────────────────────────────
+    (
+        team_ctx,
+        home_xg_res,
+        away_xg_res,
+        lineups_res,
+        pinnacle_res,
+    ) = await asyncio.gather(
+        get_match_context(match.home_team, match.away_team),
+        get_team_xg(match.home_team, league),
+        get_team_xg(match.away_team, league),
+        get_match_lineups(match.home_team, match.away_team, match.match_datetime),
+        get_pinnacle_odds(match.home_team, match.away_team, league),
+        return_exceptions=True,
+    )
 
+    # Safely unpack with fallbacks
+    if isinstance(team_ctx, Exception):
+        logger.error("Team context failed for %s: %s", match.display_name, team_ctx)
+        home_stats = _dummy_stats(match.home_team, True)
+        away_stats = _dummy_stats(match.away_team, False)
+        h2h = H2HRecord()
+    else:
+        home_stats, away_stats, h2h = team_ctx
+
+    home_xg = None if isinstance(home_xg_res, Exception) else home_xg_res
+    away_xg = None if isinstance(away_xg_res, Exception) else away_xg_res
+    lineups = None if isinstance(lineups_res, Exception) else lineups_res
+    pinnacle = None if isinstance(pinnacle_res, Exception) else pinnacle_res
+
+    # ── Step 2: Enhance Poisson inputs with xG data ──────────────────────────
+    # xG is a better predictor than actual goals — use it when available
+    if home_xg:
+        home_stats.avg_scored = home_xg.xg_per_game
+        home_stats.avg_conceded = home_xg.xga_per_game
+        # Estimate home/away splits with standard ~12% home advantage
+        home_stats.home_avg_scored = round(home_xg.xg_per_game * 1.12, 3)
+        home_stats.home_avg_conceded = round(home_xg.xga_per_game * 0.90, 3)
+
+    if away_xg:
+        away_stats.avg_scored = away_xg.xg_per_game
+        away_stats.avg_conceded = away_xg.xga_per_game
+        away_stats.away_avg_scored = round(away_xg.xg_per_game * 0.88, 3)
+        away_stats.away_avg_conceded = round(away_xg.xga_per_game * 1.10, 3)
+
+    # ── Step 3: Run Poisson ───────────────────────────────────────────────────
     try:
-        home_stats, away_stats, h2h = await get_match_context(
-            match.home_team, match.away_team
-        )
         poisson = run_poisson_model(home_stats, away_stats, h2h, ou_line=ou_line)
         ml_h, ml_a = most_likely_score(poisson.score_matrix)
     except Exception as e:
-        logger.error("Stats fetch failed for %s: %s", match.display_name, e)
+        logger.error("Poisson failed for %s: %s", match.display_name, e)
+        poisson = None
+        ml_h = ml_a = 1
 
-    # ── Step 2: Build John's briefing ────────────────────────────────────────
+    # ── Step 4: Build John's briefing ────────────────────────────────────────
     def _impl(odds: float | None) -> str:
         return f"{1 / odds * 100:.1f}%" if odds else "N/A"
 
-    if poisson and home_stats and away_stats and h2h:
-        stats_block = (
-            f"POISSON MODEL (statistical baseline):\n"
+    xg_note = " (xG-enhanced via Understat)" if (home_xg or away_xg) else " (goal-average based)"
+    if poisson:
+        poisson_block = (
+            f"POISSON MODEL{xg_note}:\n"
             f"- xG: {poisson.lambda_home:.2f} (Home) vs {poisson.lambda_away:.2f} (Away)\n"
-            f"- P(Home Win): {poisson.p_home_win:.1%} | "
-            f"P(Draw): {poisson.p_draw:.1%} | "
-            f"P(Away Win): {poisson.p_away_win:.1%}\n"
-            f"- P(Over {ou_line}): {poisson.p_over_2_5:.1%} | "
-            f"P(Under {ou_line}): {poisson.p_under_2_5:.1%}\n"
-            f"- Most likely score: {ml_h}-{ml_a}\n"
-            f"\n"
-            f"TEAM STATS (last 10 matches):\n"
-            f"- {match.home_team} at home: "
-            f"{home_stats.home_avg_scored:.1f} scored / "
-            f"{home_stats.home_avg_conceded:.1f} conceded per game | "
-            f"Form: {home_stats.form or 'N/A'}\n"
-            f"- {match.away_team} away: "
-            f"{away_stats.away_avg_scored:.1f} scored / "
-            f"{away_stats.away_avg_conceded:.1f} conceded per game | "
-            f"Form: {away_stats.form or 'N/A'}\n"
-            f"\n"
-            f"HEAD-TO-HEAD (last {h2h.total_matches} meetings):\n"
-            f"- {match.home_team} wins: {h2h.home_wins} | "
-            f"Draws: {h2h.draws} | "
-            f"{match.away_team} wins: {h2h.away_wins}\n"
-            f"- Avg goals: {h2h.avg_goals_home:.1f} - {h2h.avg_goals_away:.1f}"
+            f"- P(Home): {poisson.p_home_win:.1%} | P(Draw): {poisson.p_draw:.1%} | P(Away): {poisson.p_away_win:.1%}\n"
+            f"- P(Over {ou_line}): {poisson.p_over_2_5:.1%} | P(Under {ou_line}): {poisson.p_under_2_5:.1%}\n"
+            f"- Most likely score: {ml_h}-{ml_a}"
         )
     else:
-        stats_block = "STATISTICAL DATA: Unavailable — use odds and news only."
+        poisson_block = "POISSON MODEL: Unavailable."
+
+    home_xg_line = (
+        f"  Understat xG: {home_xg.xg_per_game:.2f}/game | xGA: {home_xg.xga_per_game:.2f}/game "
+        f"({home_xg.matches_played} matches)"
+        if home_xg else ""
+    )
+    away_xg_line = (
+        f"  Understat xG: {away_xg.xg_per_game:.2f}/game | xGA: {away_xg.xga_per_game:.2f}/game "
+        f"({away_xg.matches_played} matches)"
+        if away_xg else ""
+    )
+
+    team_block = (
+        f"TEAM STATS:\n"
+        f"- {match.home_team} (home): "
+        f"{home_stats.home_avg_scored:.1f} scored / {home_stats.home_avg_conceded:.1f} conceded | "
+        f"Form: {home_stats.form or 'N/A'}\n"
+        + (home_xg_line + "\n" if home_xg_line else "")
+        + f"- {match.away_team} (away): "
+        f"{away_stats.away_avg_scored:.1f} scored / {away_stats.away_avg_conceded:.1f} conceded | "
+        f"Form: {away_stats.form or 'N/A'}\n"
+        + (away_xg_line + "\n" if away_xg_line else "")
+        + f"\n"
+        f"HEAD-TO-HEAD (last {h2h.total_matches} meetings): "
+        f"{h2h.home_wins}W / {h2h.draws}D / {h2h.away_wins}L | "
+        f"Avg goals: {h2h.avg_goals_home:.1f} - {h2h.avg_goals_away:.1f}"
+    )
 
     sp_block = (
         f"SINGAPORE POOLS ODDS:\n"
@@ -367,31 +421,42 @@ async def predict_match_with_john(match: Match) -> str:
         f"- O/U {ou_line}: Over {match.odds_over} | Under {match.odds_under}"
     )
 
+    lineup_block = format_lineup_for_briefing(lineups) if lineups else "LINEUPS: Not fetched."
+
+    if pinnacle:
+        clv = build_clv_comparison(pinnacle, match.odds_home, match.odds_draw, match.odds_away)
+        clv_block = format_clv_for_briefing(clv)
+    else:
+        clv_block = "PINNACLE LINES: Not available for this league/match."
+
+    month_year = datetime.now().strftime("%B %Y")
+    lineups_confirmed = lineups and lineups.both_confirmed
+
     briefing = (
-        f"Predict this match as John. Follow all steps below before giving your verdict.\n"
-        f"\n"
+        f"Predict this match as John.\n\n"
         f"MATCH: {match.home_team} vs {match.away_team}\n"
-        f"Competition: {match.league or 'Unknown'}\n"
-        f"Kick-off: {match.datetime_sgt}\n"
-        f"\n"
-        f"{stats_block}\n"
-        f"\n"
-        f"{sp_block}\n"
-        f"\n"
-        f"MANDATORY STEPS:\n"
-        f"1. Call search_football_news('{match.home_team} injury suspension lineup {datetime.now().strftime('%B %Y')}')\n"
-        f"2. Call search_football_news('{match.away_team} injury suspension lineup {datetime.now().strftime('%B %Y')}')\n"
-        f"3. Based on what you find, state whether any key player absences shift your probability estimate "
-        f"vs the Poisson baseline, and by how much.\n"
-        f"4. Pick your strongest market (1X2 or O/U). Call calculate_edge with your adjusted probability "
-        f"and the SP odds for that selection.\n"
-        f"5. Give your final verdict: selection, edge %, confidence level, and 2-3 sentence reasoning "
-        f"covering both the stats and the injury/lineup intel you found.\n"
-        f"\n"
-        f"Keep the output concise — this is going to Telegram. Use **bold** for headers and key verdicts."
+        f"Competition: {league or 'Unknown'}\n"
+        f"Kick-off: {match.datetime_sgt}\n\n"
+        f"{poisson_block}\n\n"
+        f"{team_block}\n\n"
+        f"{lineup_block}\n\n"
+        f"{sp_block}\n\n"
+        f"{clv_block}\n\n"
+        f"STEPS (follow in order):\n"
+        + (
+            f"1. Lineups are confirmed above — analyse key absences and tactical shape.\n"
+            if lineups_confirmed else
+            f"1. Lineups not confirmed. Call search_football_news('{match.home_team} lineup injury {month_year}') "
+            f"and search_football_news('{match.away_team} lineup injury {month_year}').\n"
+        )
+        + f"2. Based on lineup/injury intel, state your adjusted probability for each outcome vs the Poisson baseline.\n"
+        f"3. Cross-check: does the Pinnacle CLV agree with your pick? Note any conflicts.\n"
+        f"4. Pick your best market. Call calculate_edge with your adjusted probability and the SP odds.\n"
+        f"5. Verdict: selection, edge %, confidence, 2-3 sentence reasoning covering model + intel.\n\n"
+        f"Use **bold** for headers and your final verdict. Keep it concise for Telegram."
     )
 
-    # ── Step 3: John analyzes and responds ───────────────────────────────────
+    # ── Step 5: John reasons and responds ────────────────────────────────────
     try:
         client = _get_client()
         chat = client.aio.chats.create(
@@ -402,7 +467,7 @@ async def predict_match_with_john(match: Match) -> str:
                 automatic_function_calling=types.AutomaticFunctionCallingConfig(
                     disable=False,
                 ),
-                temperature=0.4,  # lower = more grounded, less creative
+                temperature=0.4,
             ),
         )
         response = await chat.send_message(briefing)
